@@ -61,6 +61,9 @@ class Mem4py:
         # msh file name
         self.inputName = problem["msh"]
 
+        # directory containing the msh file (default "msh")
+        self.mshDir = problem.get("msh_dir", "msh")
+
         # vtk result file for restart
         self.restart = False
         if "restart" in problem:
@@ -180,7 +183,8 @@ class Mem4py:
         self.N2set = []
         self.N3set = []
 
-        self.output_dir = []
+        # directory where the vtk output is written (default "output_mem4py")
+        self.output_dir = problem.get("output_dir", "output_mem4py")
 
         # constant force vector directly added to RHS, len(ndof)
         self.force_vector = []
@@ -203,6 +207,9 @@ class Mem4py:
             self.write_each_peak = True
         else:
             self.write_each_peak = False
+
+        # peak_callback, optional callable f(model, n_peak) called when an energy peak is detected in solve() KDR
+        self.peak_callback = problem.get("peak_callback", None)
 
         # write_each_timestep, if true write vtk each time step in solve()
         if not "write_each_timestep" in problem:

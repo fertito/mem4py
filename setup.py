@@ -11,7 +11,9 @@ useCython = True
 APPNAME = "mem4py"
 APPVERSION = "1.0.2"
 
-if os.name == 'nt':
+if os.environ.get('EIGEN_PATH'):
+    EIGEN_PATH = Path(os.environ['EIGEN_PATH'])
+elif os.name == 'nt':
     EIGEN_PATH = Path(r'C:\Program Files\eigen3')
 elif os.name == 'posix':
     EIGEN_PATH = Path('/usr/include/eigen3')

@@ -145,11 +145,11 @@ cdef int assemble_M_DR(double [:] M,
 
             # determine element pressure for KMem
             if nPressurized != 0:
-                if el == elPressurised[indP]:
+                if indP < nPressurized and el == elPressurised[indP]:
                     pLocal = p[indP]
                     indP += 1
             if nFSI != 0:
-                if el == elFSI[indFSI]:
+                if indFSI < nFSI and el == elFSI[indFSI]:
                     pLocal += pFSI[indFSI]
                     indFSI += 1
 
@@ -196,11 +196,11 @@ cdef int assemble_M_DR(double [:] M,
 
             # determine element pressure for KMem
             if nPressurized != 0:
-                if el == elPressurised[indP]:
+                if indP < nPressurized and el == elPressurised[indP]:
                     pLocal = p[indP]
                     indP += 1
             if nFSI != 0:
-                if el == elFSI[indFSI]:
+                if indFSI < nFSI and el == elFSI[indFSI]:
                     pLocal += pFSI[indFSI]
                     indFSI += 1
 

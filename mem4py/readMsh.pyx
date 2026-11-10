@@ -1,4 +1,5 @@
 # cython: profile=False, cdivision=True, boundcheck=False, wraparound=False, nonecheck=False, language_level=3
+import os
 import numpy as np
 cimport numpy as np
 cimport cython
@@ -128,7 +129,7 @@ cdef int readMsh(object data) except -1:
         v_restart = np.asarray(v_restart)
         w_restart = np.asarray(w_restart)
 
-    with open("msh/{}.msh".format(data.inputName)) as fin:
+    with open(os.path.join(data.mshDir, "{}.msh".format(data.inputName))) as fin:
         for line in fin:
             if 'MeshFormat' in line:
                 state = 'MeshFormat'
@@ -171,6 +172,10 @@ cdef int readMsh(object data) except -1:
                     args = line.split()
                     name = args[2].replace('"', '')
                     bnames[int(args[1])] = name
+
+                    # physical IDs need not be contiguous, grow the map to the largest ID
+                    if int(args[1]) > len(IDmap):
+                        IDmap = np.append(IDmap, - np.ones(int(args[1]) - len(IDmap), dtype=np.intc))
 
                     # lookup table format
                     # 0  -> M

@@ -286,16 +286,16 @@ cdef int writeVTK(object data) except -1:
     # if time == 0:
     #     outputDirectory = "output_mem4py/" + datetime.now().strftime("%Y%m%d-%H%M") + "/"
     #     data.output_dir = outputDirectory
-    outputDirectory = "output_mem4py"
+    outputDirectory = data.output_dir
 
 
     if not os.path.exists(outputDirectory):
            os.makedirs(outputDirectory)
 
     if time or time == 0:
-        name = "{}/{}_{:0>{}}.vtk".format(outputDirectory, inputFile, time, tLength)
+        name = os.path.join(outputDirectory, "{}_{:0>{}}.vtk".format(inputFile, time, tLength))
     else:
-        name = "{}/{}.vtk".format(outputDirectory,inputFile)
+        name = os.path.join(outputDirectory, "{}.vtk".format(inputFile))
 
     with open(name, 'w') as fout:
 

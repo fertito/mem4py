@@ -413,6 +413,14 @@ cdef int solveKDR(object data) except -1:
 
                 n_peaks += 1
 
+                # user callback with the current (peak) configuration in data.X, data.Y, data.Z
+                if data.peak_callback is not None:
+                    data.X = X
+                    data.Y = Y
+                    data.Z = Z
+                    data.u = u
+                    data.peak_callback(data, n_peaks)
+
                 break
 
     # if data.silent is False:
