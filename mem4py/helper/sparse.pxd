@@ -4,7 +4,9 @@ cdef object sparsityPattern(int [:, ::1] NBar,
                             unsigned int nelemsBar,
                             unsigned int nelemsMem,
                             unsigned int ndof,
-                            unsigned int dim)
+                            unsigned int dim,
+                            int [:, ::1] NBend,
+                            unsigned int nBend)
 
 
 cdef int addRows(double [:] data,

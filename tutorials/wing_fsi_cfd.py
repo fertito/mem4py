@@ -48,6 +48,12 @@ Vent pressure: the maximum face pressure of the wing_vent patch times P_vent_rat
 NN (1.0 if missing), P_vent = P_vent_ratio * max(p_i) [Pa], replaces P_vent of the iteration NN in
 <wing>.json (internal pressure used by paraglider_fsi.py --iteration NN).
 
+Open canopy (--open): the canopy is not closed. <wing>_cfd.msh goes straight to wing_openfoam.py,
+which meshes the canopy as a zero-thickness baffle with fluid on both sides, so the air enters the
+wing through the intakes. Only the faces on the outer side of the canopy are mapped to the CSV (the
+inner side pressure is printed for information), and P_vent of the json is left as it is. With
+--pressure-only the open / closed case is recognised from its patches (no wing_vent = open).
+
 The previous <wing>_pressure.csv is kept as <wing>/iter_NN/<wing>_pressure_previous.csv and a copy
 of the new one is written to <wing>/iter_NN/<wing>_pressure.csv.
 
@@ -56,6 +62,7 @@ Usage (from the tutorials directory):
     python wing_fsi_cfd.py --wing mywing --iteration 0
     python wing_fsi_cfd.py --iterations 2000 --procs 8
     python wing_fsi_cfd.py --no-run              only write the meshes and the case
+    python wing_fsi_cfd.py --open                open canopy (no vent), P_vent of the json kept
     python wing_fsi_cfd.py --pressure-only       only write the pressure CSV of an existing result
     then: python paraglider_fsi.py --iteration NN --solve
 """
@@ -214,15 +221,18 @@ def read_boundary(path):
     """{patch: (startFace, nFaces)} of constant/polyMesh/boundary."""
     with open(path) as f:
         text = f.read()
-    patches, name = {}, None
-    for line in text.split("\n"):
-        tokens = line.replace(";", "").split()
-        if len(tokens) == 1 and tokens[0].startswith("wing_") or tokens == ["farfield"]:
-            name = tokens[0]
-            patches[name] = {}
-        elif name and len(tokens) == 2 and tokens[0] in ("nFaces", "startFace"):
-            patches[name][tokens[0]] = int(tokens[1])
-    return {k: (v["startFace"], v["nFaces"]) for k, v in patches.items()}
+    text = text[text.index("}") + 1:]                       # skip the FoamFile header
+    patches = {}
+    for name, body in re.findall(r"(\w+)\s*\{([^{}]*)\}", text):
+        entries = dict(re.findall(r"\b(nFaces|startFace)\s+(\d+)\s*;", body))
+        if len(entries) == 2:
+            patches[name] = (int(entries["startFace"]), int(entries["nFaces"]))
+    return patches
+
+
+def is_open_case(case):
+    """True if the case was meshed with the open canopy (baffle, no wing_vent patch)."""
+    return "wing_vent" not in read_boundary(os.path.join(case, "constant", "polyMesh", "boundary"))
 
 
 def latest_time(case):
@@ -252,6 +262,55 @@ def wall_faces(case, time, patch="wing_canopy"):
         centre[k] = (((X + np.roll(X, -1, axis=0) + c) / 3) * tri_area[:, None]).sum(axis=0) / tri_area.sum()
         area[k] = a
     return centre, area, p_cell[owner]
+
+
+def outer_canopy_faces(case, time, tri_c, tri_a):
+    """Open canopy: faces of the wing patches (wing and wing_slave, the two sides of the baffle) on
+    the outer side of the wing, and the inner side pressure for information.
+
+    The outward normal of the canopy triangles comes from the sign of the volume they enclose
+    (V = sum(c . a) / 3 about their centroid, the intakes are small). A face is on the outer side
+    when its area vector (out of its fluid cell, into the fabric) is opposite to the outward normal
+    of the nearest canopy triangle, i.e. of the triangle it lies on.
+
+    snappyHexMesh puts all the faces of one side of the baffle in the same patch (wing = one side,
+    wing_slave = the other), so the side is decided per patch by a majority vote of its faces: the
+    face by face test fails where the nearest triangle centre is on another skin or a rib (trailing
+    edge, intakes, cells), which would mix inner faces into the outer side."""
+    centroid = tri_c.mean(axis=0)
+    volume = np.einsum("ij,ij->", tri_c - centroid, tri_a) / 3.0
+    n_out = np.sign(volume) * tri_a / np.linalg.norm(tri_a, axis=1)[:, None]
+    tree = cKDTree(tri_c)
+
+    patches = sorted(p for p in read_boundary(os.path.join(case, "constant", "polyMesh", "boundary"))
+                     if p.startswith("wing") and p != "wing_vent")
+    outer, inner = [], []
+    for patch in patches:
+        c, a, p = wall_faces(case, time, patch)
+        _, k = tree.query(c)
+        face_outer = np.einsum("ij,ij->i", a, n_out[k]) < 0
+        patch_outer = face_outer.sum() > 0.5 * len(p)
+        print("  %s: %d faces, %s side (%d faces of the other side by the nearest triangle test, ignored)"
+              % (patch, len(p), "outer" if patch_outer else "inner",
+                 (~face_outer if patch_outer else face_outer).sum()))
+        if patch_outer:
+            outer.append((c, a, p))
+        else:
+            inner.append((a, p))
+    if len(outer) != 1 or len(inner) != 1:
+        raise ValueError("open canopy: expected one outer and one inner wing patch in %s, got %d and %d"
+                         % (case, len(outer), len(inner)))
+
+    face_c, face_a, face_p = (np.concatenate(x) for x in zip(*outer))
+    in_a, in_p = (np.concatenate(x) for x in zip(*inner))
+    if len(face_p) == 0 or len(in_p) == 0:
+        raise ValueError("open canopy: no face on the %s side of the canopy in %s"
+                         % ("outer" if len(face_p) == 0 else "inner", case))
+    in_p = RHO_AIR * in_p
+    area = np.linalg.norm(in_a, axis=1)
+    print("  inner side: p from %.1f to %.1f Pa, area weighted mean %.2f Pa (P_vent of the json not changed)"
+          % (in_p.min(), in_p.max(), (in_p * area).sum() / area.sum()))
+    return face_c, face_a, face_p
 
 
 # --------------------------------------------------------------------------------------------------
@@ -305,11 +364,14 @@ def write_pressure_csv(wing_dir, name, out_dir):
     time = latest_time(case)
     print("canopy pressure: OpenFOAM result %s, time %s" % (case, time))
 
-    face_c, face_a, face_p = wall_faces(case, time)
-    face_p = RHO_AIR * face_p
-    print("  wing_canopy: %d faces, p from %.1f to %.1f Pa" % (len(face_p), face_p.min(), face_p.max()))
-
     ids, tri_c, tri_a = canopy_triangles(os.path.join(out_dir, name + "_cfd.msh"))
+    if is_open_case(case):
+        face_c, face_a, face_p = outer_canopy_faces(case, time, tri_c, tri_a)
+    else:
+        face_c, face_a, face_p = wall_faces(case, time)
+    face_p = RHO_AIR * face_p
+    print("  canopy outer side: %d faces, p from %.1f to %.1f Pa" % (len(face_p), face_p.min(), face_p.max()))
+
     p, sign, widened, nearest_only = map_pressure(tri_c, tri_a, face_c, face_a, face_p)
     print("  %d canopy triangles mapped (normals %s the patch normals, %d by widened search), "
           "p from %.1f to %.1f Pa" % (len(ids), "along" if sign > 0 else "opposite to", widened, p.min(), p.max()))
@@ -378,6 +440,9 @@ def main():
     parser.add_argument("--no-run", action="store_true", help="only write the meshes and the case")
     parser.add_argument("--pressure-only", action="store_true",
                         help="only write the pressure CSV of the existing OpenFOAM result")
+    parser.add_argument("--open", action="store_true",
+                        help="open canopy: no vent, the canopy is a zero-thickness baffle with air inside "
+                             "the wing; P_vent of the json is not changed")
     args = parser.parse_args()
 
     wing_dir = os.path.normpath(args.wing)
@@ -409,14 +474,20 @@ def main():
 
         cfd_msh = os.path.join(out_dir, name + "_cfd.msh")
         write_msh(cfd_msh, names, sorted(nodes.items()), elements)
-        of_msh, _ = close_canopy(cfd_msh)
-
-        run_wing(of_msh, glide, speed, os.path.join(out_dir, "openfoam"), args.iterations, args.procs,
-                 run=not args.no_run)
+        if args.open:
+            run_wing(cfd_msh, glide, speed, os.path.join(out_dir, "openfoam"), args.iterations, args.procs,
+                     run=not args.no_run, open_canopy=True)
+        else:
+            of_msh, _ = close_canopy(cfd_msh)
+            run_wing(of_msh, glide, speed, os.path.join(out_dir, "openfoam"), args.iterations, args.procs,
+                     run=not args.no_run)
 
     if not args.no_run:
         write_pressure_csv(wing_dir, name, out_dir)
-        update_vent_pressure(wing_dir, name, out_dir, n)
+        if is_open_case(os.path.join(out_dir, "openfoam")):
+            print("open canopy: P_vent of %s iteration %d not changed" % (name + ".json", n))
+        else:
+            update_vent_pressure(wing_dir, name, out_dir, n)
 
 
 if __name__ == "__main__":

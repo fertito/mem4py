@@ -624,6 +624,33 @@ class Mem4py:
         writeVTK(self)
 
 
+    # bending state of the rod hinges ("B" elements) in the current configuration
+    def rodBending(self):
+        """
+        per hinge (interior rod node): node IDs, turning angle phi [rad], curvature
+        kappa = 2 tan(phi / 2) / l0 [1/m], moment M = EI kappa [N m] and outer fibre
+        bending stress sigma = E d / 2 kappa [Pa] (from "d", 0 if only "EI" is given)
+        :return: dict of numpy arrays, empty arrays if there is no hinge
+        """
+        n = self.nBend
+        Nb = np.asarray(self.Nb)[:n]
+        P = np.column_stack((np.asarray(self.X), np.asarray(self.Y), np.asarray(self.Z)))
+        if n == 0:
+            phi = np.zeros(0)
+        else:
+            a = P[Nb[:, 1]] - P[Nb[:, 0]]
+            b = P[Nb[:, 2]] - P[Nb[:, 1]]
+            c = np.einsum('ij,ij->i', a, b) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1))
+            phi = np.arccos(np.clip(c, -1., 1.))
+        kappa = 2 * np.tan(phi / 2) / self.l0Bend
+        EI = self.EIBend
+        r = self.rBend
+        with np.errstate(divide='ignore', invalid='ignore'):
+            E = np.where(r > 0, EI / (np.pi * (2 * r) ** 4 / 64), 0.)
+        return {"nodes": Nb, "rod": self.rodOfHinge, "phi": phi, "kappa": kappa,
+                "M": EI * kappa, "sigma": E * r * kappa}
+
+
     # method to set all loads to zero
     def set_load_zero(self):
 

@@ -15,6 +15,7 @@ Every wing lives in its own directory <wing>/ (default demowing/) containing
     <wing>_bridle.csv
     <wing>_sew.csv          if missing, generated from the "sew" physical group of <wing>.msh,
                             piece = "sew:<gmsh entity tag>"
+    <wing>_jonc.csv         same for the optional "jonc" physical group (2 mm nylon rods)
     <wing>_attachments.csv  attachment points (node = msh node, name, type), main_l / main_r are
                             the left / right pilot attachment points
     <wing>_bridle_material.csv  optional, material of every bridle line (header
@@ -45,7 +46,7 @@ picture of the deformed wing (paraglider_pressure_deformed.png) and a picture at
 energy peak in <wing>/iter_NN/peaks/.
 
 After the solve, the mem4py vtk result is split into one vtk per part CSV, <wing>_canopy.vtk,
-<wing>_diagonals.vtk, <wing>_ribs.vtk, <wing>_straps.vtk, <wing>_bridle.vtk and <wing>_sew.vtk, containing only
+<wing>_diagonals.vtk, <wing>_ribs.vtk, <wing>_straps.vtk, <wing>_bridle.vtk, <wing>_sew.vtk and <wing>_jonc.vtk, containing only
 the triangles or lines of that CSV (in CSV order) at their deformed position (undeformed points + u),
 with every point field of the mem4py vtk (u, ...), its membrane cell fields (triangles) or cable
 cell fields (lines), and the cell field "triangle" or "line", the gmsh element number of each
@@ -115,8 +116,8 @@ import mem4py as m4p
 
 WING_DIR = "demowing"            # default wing directory, see --wing
 JSON_ITERATION = 0               # default json iteration for P_ratio, P_vent and the output directory, see --iteration
-PARTS = ("canopy", "diagonals", "ribs", "straps", "bridle", "sew")    # <wing>_<part>.csv -> <wing>_<part>.vtk
-PHYSICAL_PARTS = ("sew",)        # part CSVs generated from the gmsh physical group of that name if missing
+PARTS = ("canopy", "diagonals", "ribs", "straps", "bridle", "sew", "jonc")    # <wing>_<part>.csv -> <wing>_<part>.vtk
+PHYSICAL_PARTS = ("sew", "jonc")  # part CSVs generated from the gmsh physical group of that name if missing
 NEXT_P_RATIO = 1.0               # P_ratio written to the next iteration of the json
 NEXT_P_VENT = 50.0               # [Pa] P_vent written to the next iteration of the json
 FORCE_SUM_SCALE = 0.005          # [m/N] length of the resultant line of <wing>_force_sum.vtk
@@ -172,7 +173,7 @@ def paraglider_problem(wing, output_dir):
     elStruc["canopy"] = {"set": "ELEMENT",
                          "type": "MW",
                          "h": 3E-5,
-                         "E": 2.07E8,
+                         "E": 2.5E9,
                          "density": 9.61,
                          "nu": 0.3,
                          "FSI": True}
@@ -180,14 +181,14 @@ def paraglider_problem(wing, output_dir):
     elStruc["rib"] = {"set": "ELEMENT",
                       "type": "MW",
                       "h": 3E-5,
-                      "E": 2.07E8,
+                      "E": 2.5E9,
                       "density": 9.61,
                       "nu": 0.3}
 
     elStruc["sew"] = {"set": "ELEMENT",
                       "type": "CW",
                       "d": 1.3E-4,
-                      "E": 2.07E9,
+                      "E": 2.5E9,
                       "density": 9.61}
 
     elStruc["bridle"] = {"set": "ELEMENT",
@@ -195,6 +196,22 @@ def paraglider_problem(wing, output_dir):
                          "d": 1.3E-4,
                          "E": 2.07E13,
                          "density": 9.61}
+
+    # optional nylon rod (jonc / rigifoil), only if the "jonc" physical group is in <wing>.msh
+    # (mem4py refuses an elStruc set absent from the msh). Type "B": rod = "C" bar (axial, also
+    # carries compression, unlike "CW" which goes slack) plus bending stiffness.
+    # 2 mm polyamide (PA6/PA66) rod: E ~ 2.5 GPa (between dry ~3 GPa and conditioned ~2 GPa),
+    # density 1140 kg/m3 -> EA ~ 7.9 kN, 3.6 g/m.
+    # Bending hinges sit at the interior nodes of every rod (connected chain of jonc lines),
+    # EI = E pi d^4 / 64 ~ 2.0E-3 N m2. Each rod is straight and stress-free at rest,
+    # so following the rib outline in the msh pre-stresses it in bending (M = EI kappa).
+    if "jonc" in msh_physical_names(wing.msh):
+        elStruc["jonc"] = {"set": "ELEMENT",
+                           "type": "B",
+                           "d": 2E-3,
+                           "E": 2.5E9,
+                           "density": 11.40}
+        print("Physical group \"jonc\" found: 2 mm nylon rod elements (type B)")
 
     theta = 90 * np.pi / 180
     g = 9.81
@@ -221,6 +238,15 @@ def paraglider_problem(wing, output_dir):
 # --------------------------------------------------------------------------------------------------
 # pressure mapping
 # --------------------------------------------------------------------------------------------------
+
+def msh_physical_names(msh_path):
+    """Names of the gmsh physical groups of the msh (set, empty if no $PhysicalNames)."""
+    with open(msh_path) as f:
+        for line in f:
+            if line.startswith("$PhysicalNames"):
+                return {next(f).split(maxsplit=2)[2].strip().strip('"') for _ in range(int(next(f)))}
+    return set()
+
 
 def msh_elements(msh_path, gmsh_type, ordered=False):
     """gmsh element number -> sorted (0-based) node tuple, for every element of gmsh_type
@@ -681,11 +707,15 @@ def export_parts(wing, vtk_path, out_dir):
     print("Splitting %s per part" % vtk_path)
     vtk = read_mem4py_vtk(vtk_path)
 
+    physical_names = msh_physical_names(wing.msh)
     for name in PHYSICAL_PARTS:
         if not os.path.isfile(os.path.join(wing.dir, "%s_%s.csv" % (wing.name, name))):
-            write_physical_csv(wing, name)
+            if name in physical_names:
+                write_physical_csv(wing, name)
+            else:
+                print("  no %r physical group in %s, %s_%s.csv not generated" % (name, wing.msh, wing.name, name))
 
-    nodes_to_cell, msh_elem = {}, {}       # per element kind, built on first use
+    elem_to_cell = {}                      # per element kind, built on first use
     for part in PARTS:
         csv_path = os.path.join(wing.dir, "%s_%s.csv" % (wing.name, part))
         if not os.path.isfile(csv_path):
@@ -694,25 +724,32 @@ def export_parts(wing, vtk_path, out_dir):
         kind, elem_id = read_part_csv(csv_path)
         gmsh_type, vtk_cell_type = ELEMENT_KINDS[kind][:2]
 
-        if kind not in nodes_to_cell:
-            # mem4py cells of this kind, identified by their sorted node tuple
+        if kind not in elem_to_cell:
+            # mem4py cells of this kind, identified by their sorted node tuple, in vtk order
             cells = {}
             for c in np.flatnonzero(vtk["cell_types"] == vtk_cell_type):
                 key = tuple(sorted(vtk["cells"][c]))
                 cells.setdefault(key, []).append(c)
-            duplicated = sum(1 for c in cells.values() if len(c) > 1)
+            # Elements sharing their nodes (e.g. a "jonc" rod laid on a "sew" line) are told apart
+            # by their order: mem4py keeps the msh element order, so the n-th msh element on a node
+            # tuple is the n-th vtk cell on it.
+            used, mapping, duplicated = {}, {}, 0
+            for elem, key in msh_elements(wing.msh, gmsh_type).items():
+                n = used.get(key, 0)
+                if key in cells and n < len(cells[key]):
+                    mapping[elem] = cells[key][n]
+                    used[key] = n + 1
+                    duplicated += n == 1
             if duplicated:
-                print("  Warning: %d %ss of the vtk result share their nodes with another one, "
-                      "their fields may be mixed up" % (duplicated, kind))
-            nodes_to_cell[kind] = {k: c[0] for k, c in cells.items()}
-            msh_elem[kind] = msh_elements(wing.msh, gmsh_type)
+                print("  %d node tuples hold several %ss, matched in msh order" % (duplicated, kind))
+            elem_to_cell[kind] = mapping
 
-        to_cell, msh_nodes = nodes_to_cell[kind], msh_elem[kind]
-        unknown = [i for i in elem_id if i not in msh_nodes or msh_nodes[i] not in to_cell]
+        to_cell = elem_to_cell[kind]
+        unknown = [i for i in elem_id if i not in to_cell]
         if unknown:
             raise ValueError("%d %ss of %s are not in the vtk result (first: %d)"
                              % (len(unknown), kind, csv_path, unknown[0]))
-        cell_index = np.array([to_cell[msh_nodes[i]] for i in elem_id], dtype=int)
+        cell_index = np.array([to_cell[i] for i in elem_id], dtype=int)
 
         path = os.path.join(out_dir, "%s_%s.vtk" % (wing.name, part))
         write_part_vtk(path, vtk, cell_index, elem_id, kind, "%s %s (deformed)" % (wing.name, part))

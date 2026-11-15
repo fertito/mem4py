@@ -25,7 +25,9 @@ cdef object sparsityPattern(int [:, ::1] NCable,
                             unsigned int nelemsCable,
                             unsigned int nelemsMem,
                             unsigned int ndof,
-                            unsigned int dim):
+                            unsigned int dim,
+                            int [:, ::1] NBend,
+                            unsigned int nBend):
     """
     determines non-zero entry locations in stiffness matrix and creates map from coordinate (coo_matrix)
     to compressed sparse row (csr_matrix) in vector form, sorted by rows..
@@ -35,14 +37,16 @@ cdef object sparsityPattern(int [:, ::1] NCable,
     :param nelemsMem: 
     :param ndof: 
     :param dim: 
+    :param NBend: rod bending hinge connectivity [node 0, node 1, node 2], appended after membranes
+    :param nBend: number of bending hinges
     :return: 
     """
 
     cdef:
-        double [:] data = np.ones(dim * dim * (9 * nelemsMem + 4 * nelemsCable), dtype=np.double)
+        double [:] data = np.ones(dim * dim * (9 * nelemsMem + 4 * nelemsCable + 9 * nBend), dtype=np.double)
 
-        unsigned int [:] row = np.zeros(dim * dim * (9 * nelemsMem + 4 * nelemsCable), dtype=np.uintc)
-        unsigned int [:] col = np.zeros(dim * dim * (9 * nelemsMem + 4 * nelemsCable), dtype=np.uintc)
+        unsigned int [:] row = np.zeros(dim * dim * (9 * nelemsMem + 4 * nelemsCable + 9 * nBend), dtype=np.uintc)
+        unsigned int [:] col = np.zeros(dim * dim * (9 * nelemsMem + 4 * nelemsCable + 9 * nBend), dtype=np.uintc)
 
         unsigned int [:] allDofCable = np.empty(2 * dim, dtype=np.uintc)
         unsigned int [:] allDofMem = np.empty(3 * dim, dtype=np.uintc)
@@ -86,6 +90,23 @@ cdef object sparsityPattern(int [:, ::1] NCable,
                 runner += 1
 
         # increase index by length of entries in local stiffness matrix Kloc
+        index += 9 * dim * dim
+
+    # Loop over all rod bending hinges (3 nodes, same block layout as membranes)
+    for el in range(nBend):
+
+        for i in range(dim):
+            allDofMem[i]           = dim * (NBend[el, 0] + 1) - (dim - i % dim)
+            allDofMem[i + dim]     = dim * (NBend[el, 1] + 1) - (dim - i % dim)
+            allDofMem[i + 2 * dim] = dim * (NBend[el, 2] + 1) - (dim - i % dim)
+
+        runner = 0
+        for i in range(3 * dim):
+            for j in range(3 * dim):
+                row[index + runner] = allDofMem[i]
+                col[index + runner] = allDofMem[j]
+                runner += 1
+
         index += 9 * dim * dim
 
     # assemble stiffness matrix

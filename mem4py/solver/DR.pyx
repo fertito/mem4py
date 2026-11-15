@@ -151,6 +151,11 @@ cdef int solveKDR(object data) except -1:
 
         unsigned int [:] pre_active = data.pre_active
 
+        # rod bending hinges ("B" elements)
+        int [:, ::1] NBend = data.Nb
+        unsigned int nBend = data.nBend
+        double [:] kBend = data.kBend
+
     # aero input
     aero = data.aero
 
@@ -163,7 +168,7 @@ cdef int solveKDR(object data) except -1:
     loadSteps = (1 - np.linspace(0, 1, nLoadSteps, endpoint=False))[::-1]
 
     # determine sparsity pattern
-    orderTemp, indptrTemp, indicesTemp = sparsityPattern(NCable, NMem, nelemsCable, nelemsMem, ndof, dim)
+    orderTemp, indptrTemp, indicesTemp = sparsityPattern(NCable, NMem, nelemsCable, nelemsMem, ndof, dim, NBend, nBend)
 
     cdef:
         unsigned int [:] order = np.asarray(orderTemp, dtype=np.uintc)
@@ -273,7 +278,7 @@ cdef int solveKDR(object data) except -1:
                               indptr, elPressurised, elFSI, state, dataK, diagK,
                               &alpha, sumRowWithDiag, dim, &IE, method, lam, P,
                               alpha_array, wrinkling_iter, iter_goal, sigma_max, loadStep,
-                              ELocal, SLocal)
+                              ELocal, SLocal, NBend, nBend, kBend)
 
                 # Determine residual R at current time step from internal force vector (global)
                 subtract_vv(RHS, Fint, R)
@@ -309,7 +314,7 @@ cdef int solveKDR(object data) except -1:
                               indptr, elPressurised, elFSI, state, dataK, diagK,
                               &alpha, sumRowWithDiag, dim, &IE, method, lam, P,
                               alpha_array, wrinkling_iter, iter_goal, sigma_max, loadStep,
-                              ELocal, SLocal)
+                              ELocal, SLocal, NBend, nBend, kBend)
 
                 # Determine residual R at current time step from internal force vector (global)
                 subtract_vv(RHS, Fint, R)
@@ -384,7 +389,7 @@ cdef int solveKDR(object data) except -1:
                               indptr, elPressurised, elFSI, state, dataK, diagK,
                               &alpha, sumRowWithDiag, dim, &IE, method, lam, P,
                               alpha_array, wrinkling_iter, iter_goal, sigma_max, loadStep,
-                              ELocal, SLocal)
+                              ELocal, SLocal, NBend, nBend, kBend)
                 
                 if follower_pressure is True:
                     # RHS vector in current configuration

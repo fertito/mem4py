@@ -160,8 +160,13 @@ cdef int solveTransient(object data) except -1:
 
             Minv[i] = 1 / M[i]
 
+    # rod bending hinges are only assembled by the KDR solver
+    if data.nBend > 0:
+        raise Exception("Rod bending (\"B\" elements) is only implemented in the KDR solver.")
+
     # determine sparsity pattern
-    orderTemp, indptrTemp, indicesTemp = sparsityPattern(NCable, NMem, nelemsCable, nelemsMem, ndof, dim)
+    orderTemp, indptrTemp, indicesTemp = sparsityPattern(NCable, NMem, nelemsCable, nelemsMem, ndof, dim,
+                                                         data.Nb, 0)
 
     cdef:
         unsigned int [:] order = np.asarray(orderTemp, dtype=np.uintc)

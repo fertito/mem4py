@@ -178,6 +178,19 @@ cdef int writeVTK(object data) except -1:
                   eps_cable, thetaVec, VMS, area3, L0, Ew, state_cable, state_mem, wrinkle,
                   dim, data.P, data.alpha_array, data.solverOptions["sigma_max"], wrinkling_model)
 
+    # rod bending ("B" elements): per cable element the largest |moment| and |outer fibre stress|
+    # of the hinges at its two end nodes, 0 for all other elements
+    cdef double [:] moment_cable = np.zeros(nelemsMem + nelemsCable, dtype=np.double)
+    cdef double [:] bending_stress_cable = np.zeros(nelemsMem + nelemsCable, dtype=np.double)
+
+    if data.nBend > 0:
+        rb = data.rodBending()
+        moment_np = np.asarray(moment_cable)
+        stress_np = np.asarray(bending_stress_cable)
+        for side in range(2):
+            np.maximum.at(moment_np, data.elOfHinge[:, side], np.abs(rb["M"]))
+            np.maximum.at(stress_np, data.elOfHinge[:, side], np.abs(rb["sigma"]))
+
     # forces in cable
     if nelemsCable > 0:
         for n in range(nelemsCable):
@@ -403,6 +416,13 @@ cdef int writeVTK(object data) except -1:
 
                 # Kinetic energy in cable
                 # writeScalarElement(KE_cable, 'Cable_KE', nelemsCable + nelemsMem, fout)
+
+                # bending of "B" elements (rods)
+                if data.nBend > 0:
+
+                    writeScalarElement(bending_stress_cable, "Cable_bending_stress", nelemsCable + nelemsMem, fout)
+
+                    writeScalarElement(moment_cable, "Cable_bending_moment", nelemsCable + nelemsMem, fout)
 
                 if data.pre_active[0] == 1:
 

@@ -182,6 +182,7 @@ cdef int readMsh(object data) except -1:
                     # 1  -> MW
                     # 2  -> C
                     # 3  -> CW
+                    # 2  -> B (C bar + rod bending hinges, see buildRodHinges)
                     # 4  -> fixAll
                     # 5  -> fixX
                     # 6  -> fixY
@@ -212,7 +213,7 @@ cdef int readMsh(object data) except -1:
                     if data.elStruc[name]["set"] == "ELEMENT":
 
                         # cable and membrane pre_stress and pre-strain
-                        if data.elStruc[name]["type"] == "C" or data.elStruc[name]["type"] == "CW":
+                        if data.elStruc[name]["type"] in ("C", "CW", "B"):
                             if "pre_stress" in data.elStruc[name]:
                                 pre_stress_cable_ID.append(int(args[1]))
                                 pre_stress_cable_mag.append(data.elStruc[name]["pre_stress"])
@@ -249,12 +250,15 @@ cdef int readMsh(object data) except -1:
                             IDmap[int(args[1]) - 1] = 0
                         elif data.elStruc[name]["type"] == "MW":
                             IDmap[int(args[1]) - 1] = 1
-                        elif data.elStruc[name]["type"] == "C":
+                        elif data.elStruc[name]["type"] == "C" or data.elStruc[name]["type"] == "B":
                             IDmap[int(args[1]) - 1] = 2
                         elif data.elStruc[name]["type"] == "CW":
                             IDmap[int(args[1]) - 1] = 3
                         else:
                             raise Exception("No valid ELEMENT type found.")
+                        if "EI" in data.elStruc[name] and data.elStruc[name]["type"] != "B":
+                            raise Exception("Set {}: \"EI\" is only available for "
+                                            "type \"B\" elements.".format(name))
                     elif data.elStruc[name]["set"] == "BC":
                         if data.elStruc[name]["type"] == "fixAll":
                             IDmap[int(args[1]) - 1] = 4
@@ -1200,6 +1204,9 @@ cdef int readMsh(object data) except -1:
         rho3[i] = data.elStruc[bnames[el]]["density"]
         PoissonsRat[i] = data.elStruc[bnames[el]]["nu"]
 
+    # rod bending hinges for B sets
+    buildRodHinges(data, Nc, nelemsCable, LCable, YoungsMod2, bnames)
+
     data.t = h
     data.area2 = area2
     data.rho3 = rho3
@@ -1366,3 +1373,137 @@ cdef int readMsh(object data) except -1:
     data.pre_u_dof = pre_u_dof
     data.pre_u = pre_u
     data.M = M
+
+
+def buildRodHinges(data, int [:, ::1] Nc, unsigned int nelemsCable, double [:] LCable, double [:] E2, bnames):
+    """
+    Build the bending hinges of rods made of "B" elements.
+
+    A "B" element is a "C" bar (axial, carries compression) plus bending. Every set of type "B"
+    (EI = E pi d^4 / 64, or an explicit "EI") is split into rods (connected chains of its line elements). Each rod is straight and stress-free in
+    its rest state, so a hinge is placed at every interior node (node shared by exactly two
+    elements of the same set). Free rod ends get no hinge, and different sets never share a
+    hinge. A node shared by more than two elements of the set is a branch: no hinge is placed
+    there and a warning is printed.
+
+    sets data.Nb [nBend, 3] (node 0, middle node, node 2), data.nBend, data.kBend (EI / l0),
+    data.EIBend, data.l0Bend, data.rBend (outer radius d / 2), data.rodOfHinge and
+    data.elOfHinge [nBend, 2] (the two cable elements meeting at the hinge)
+    """
+    hinges = []
+    kB = []
+    EIList = []
+    l0List = []
+    rList = []
+    rodID = []
+    elOfHinge = []
+    nRods = 0
+    summary = []
+
+    NcArr = np.asarray(Nc)[:nelemsCable]
+    L0Arr = np.asarray(LCable)[:nelemsCable]
+    E2Arr = np.asarray(E2)[:nelemsCable]
+
+    for pid in (sorted(set(NcArr[:, 0].tolist())) if nelemsCable > 0 else []):
+
+        name = bnames[pid]
+        props = data.elStruc[name]
+
+        if props["type"] != "B":
+            continue
+
+        els = np.where(NcArr[:, 0] == pid)[0]
+
+        if "EI" in props:
+            EI = float(props["EI"])
+        else:
+            EI = float(E2Arr[els[0]]) * np.pi * props["d"] ** 4 / 64
+
+        # node -> {neighbour node: element}
+        adj = {}
+        for e in els:
+            a, b = int(NcArr[e, 1]), int(NcArr[e, 2])
+            if a == b:
+                continue
+            adj.setdefault(a, {})[b] = e
+            adj.setdefault(b, {})[a] = e
+
+        # connected components = rods
+        comp = {}
+        nRodsSet = 0
+        for start in adj:
+            if start in comp:
+                continue
+            stack = [start]
+            while stack:
+                n = stack.pop()
+                if n in comp:
+                    continue
+                comp[n] = nRods + nRodsSet
+                stack.extend(m for m in adj[n] if m not in comp)
+            nRodsSet += 1
+
+        nBranch = 0
+        nHingeSet = 0
+        phiMax = 0.
+        kappaMax = 0.
+        for n, nb in adj.items():
+            if len(nb) > 2:
+                nBranch += 1
+                continue
+            if len(nb) != 2:
+                continue
+            (n0, e0), (n2, e1) = nb.items()
+            l0 = 0.5 * (L0Arr[e0] + L0Arr[e1])
+            hinges.append([n0, n, n2])
+            kB.append(EI / l0)
+            EIList.append(EI)
+            l0List.append(l0)
+            rList.append(props["d"] / 2 if "d" in props else 0.)
+            rodID.append(comp[n])
+            elOfHinge.append([e0, e1])
+            nHingeSet += 1
+
+            # initial turning angle (rest state is straight)
+            p0 = np.array([data.X0[n0], data.Y0[n0], data.Z0[n0]])
+            p1 = np.array([data.X0[n], data.Y0[n], data.Z0[n]])
+            p2 = np.array([data.X0[n2], data.Y0[n2], data.Z0[n2]])
+            ea = p1 - p0
+            eb = p2 - p1
+            c = np.dot(ea, eb) / (np.linalg.norm(ea) * np.linalg.norm(eb))
+            phi = np.arccos(np.clip(c, -1., 1.))
+            phiMax = max(phiMax, phi)
+            kappaMax = max(kappaMax, 2 * np.tan(phi / 2) / l0)
+
+        if nBranch > 0:
+            print("WARNING: set {}: {} node(s) shared by more than two elements, "
+                  "no bending hinge placed there".format(name, nBranch))
+
+        summary.append((name, nRodsSet, nHingeSet, EI, phiMax, kappaMax,
+                        props.get("d", 0.) / 2 * float(E2Arr[els[0]]) * kappaMax))
+        nRods += nRodsSet
+
+    nBend = len(hinges)
+
+    if nBend == 0:
+        data.Nb = np.zeros((1, 3), dtype=np.intc)
+        data.kBend = np.zeros(1, dtype=np.double)
+    else:
+        data.Nb = np.ascontiguousarray(hinges, dtype=np.intc)
+        data.kBend = np.asarray(kB, dtype=np.double)
+
+    data.nBend = nBend
+    data.EIBend = np.asarray(EIList, dtype=np.double)
+    data.l0Bend = np.asarray(l0List, dtype=np.double)
+    data.rBend = np.asarray(rList, dtype=np.double)
+    data.rodOfHinge = np.asarray(rodID, dtype=np.intc)
+    data.elOfHinge = np.asarray(elOfHinge, dtype=np.intc).reshape(-1, 2)
+    data.nRods = nRods
+
+    if data.silent is False:
+        for name, nr, nh, EI, phiMax, kappaMax, sigma in summary:
+            print("Rod bending in set {}: {} rod(s), {} hinge(s), EI = {:.3E} N m2, "
+                  "initial max turning angle {:.1f} deg, max curvature {:.1f} 1/m "
+                  "(R = {:.4f} m), max bending stress {:.3E} Pa".format(
+                      name, nr, nh, EI, np.degrees(phiMax), kappaMax,
+                      1 / kappaMax if kappaMax > 0 else np.inf, sigma))

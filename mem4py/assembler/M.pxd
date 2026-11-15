@@ -48,7 +48,10 @@ cdef int assemble_M_DR(double [:] M,
                        double sigma_max,
                        double loadStep,
                        double [:] ELocal,
-                       double [:] SLocal) except -1
+                       double [:] SLocal,
+                       int [:, ::1] NBend,
+                       unsigned int nBend,
+                       double [:] kBend) except -1
 
 
 cdef int assembleM(int [:, ::1] NMem,

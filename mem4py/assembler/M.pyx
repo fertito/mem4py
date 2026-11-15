@@ -12,6 +12,7 @@ from elements.membrane cimport membrane3DStrain
 from elements.membrane cimport membrane3DKmat
 from elements.membrane cimport membraneStress
 from elements.membrane cimport membraneWrinklingJarasjarungkiat
+from elements.rod cimport rodBendingFintAndK
 from helper.sparse cimport addRows
 
 
@@ -73,7 +74,10 @@ cdef int assemble_M_DR(double [:] M,
                        double sigma_max,
                        double loadStep,
                        double [:] ELocal,
-                       double [:] SLocal) except -1:
+                       double [:] SLocal,
+                       int [:, ::1] NBend,
+                       unsigned int nBend,
+                       double [:] kBend) except -1:
     """
     Mass matrix (identity) assembly according to Alamatian et al. 2012,
     largest eigenvalue of K scales mass for optimal DR convergence
@@ -212,6 +216,17 @@ cdef int assemble_M_DR(double [:] M,
 
             # strain energy
             IE[0] += area3[el] * t[el] * (ELocal[0] * SLocal[0] + ELocal[1] * SLocal[1] + 2 * ELocal[2] * SLocal[2])
+
+    # Loop over all rod bending hinges (blocks appended after membranes in the sparsity pattern)
+    for el in range(nBend):
+
+        rodBendingFintAndK(X, Y, Z, NBend, el, kBend[el], dim, index, Fint, data, diagK, order, &SE)
+
+        # increase index by length of entries in local stiffness matrix Kloc (3 dim x 3 dim)
+        index += 9 * dim * dim
+
+        # strain energy (IE is halved below, SE is the hinge energy itself)
+        IE[0] += 2 * SE
     
     addRows(data, indptr, ndof, diagK, alpha, M, Minv, sumRowWithDiag, wrinklingFlag, dim, method, lam)
 

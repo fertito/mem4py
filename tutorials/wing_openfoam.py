@@ -1,17 +1,25 @@
 """
-OpenFOAM flow around a closed paraglider wing (<name>_of.msh written by close_canopy.py).
+OpenFOAM flow around a closed paraglider wing (<name>_of.msh written by close_canopy.py), or
+around the open canopy (--open).
 
-The canopy + vent surface of the _of mesh is a closed (watertight) body. It is written as an STL
-with two regions, meshed with blockMesh + snappyHexMesh (fluid outside the wing only) and the
-steady incompressible RANS flow (foamRun, incompressibleFluid, k-omega SST, SIMPLE) is solved at
-the requested speed and angle of attack. OpenFOAM-12 from blueCFD-Core 2024 is used, in parallel
-with MS-MPI.
+Closed wing (default): the canopy + vent surface of the _of mesh is a closed (watertight) body. It
+is written as an STL with two regions, meshed with blockMesh + snappyHexMesh (fluid outside the
+wing only) and the steady incompressible RANS flow (foamRun, incompressibleFluid, k-omega SST,
+SIMPLE) is solved at the requested speed and angle of attack. OpenFOAM-12 from blueCFD-Core 2024 is
+used, in parallel with MS-MPI.
+
+Open canopy (--open): only the "canopy" group of the mesh is used, without vent, as a zero-thickness
+surface (snappyHexMesh faceZone with faceType baffle). The fluid is meshed outside and inside the
+wing and the air enters the wing through the intakes. Every canopy face gets a wall face on each
+side, in the patches wing and wing_slave (named after the surface). The mesh can be any gmsh
+mesh with a "canopy" group, e.g. the original <wing>.msh.
 
 Axes of the mesh: x chordwise (leading edge -> trailing edge), y spanwise, z up. The free stream
 is U = speed * (cos(aoa), 0, sin(aoa)): a positive angle of attack is wind from below.
 
 The finished case gets an empty case.foam file to open it in ParaView. Patches: wing_canopy and
-wing_vent (group wingGroup), farfield. Lift / drag coefficients (forceCoeffs function object,
+wing_vent (wing and wing_slave with --open; group wingGroup), farfield.
+Lift / drag coefficients (forceCoeffs function object,
 reference area = wing area projected on the x-y plane, reference length = central chord) are in
 postProcessing/forceCoeffs/.
 
@@ -19,6 +27,7 @@ Usage (from the tutorials directory):
     python wing_openfoam.py --aoa 8 --speed 10
     python wing_openfoam.py msh/demowing_of.msh --aoa 8 --speed 10 --iterations 2000 --procs 16
     python wing_openfoam.py --aoa 8 --speed 10 --no-run      write the case only
+    python wing_openfoam.py msh/demowing.msh --open --aoa 8 --speed 10   open canopy
 """
 import argparse
 import glob
@@ -112,18 +121,19 @@ def processor_split(n):
     return best[1]
 
 
-def read_wing(mesh):
-    """Nodes and triangles of the canopy and vent groups of the _of mesh."""
+def read_wing(mesh, groups=("canopy", "vent")):
+    """Nodes and triangles of the given 2D groups of the mesh (canopy and vent of the _of mesh)."""
     names, nodes, elements = read_msh(mesh)
     tags = {name: tag for tag, (dim, name) in names.items() if dim == 2}
-    for group in ("canopy", "vent"):
+    for group in groups:
         if group not in tags:
             raise ValueError("no 2D physical group '%s' in %s (run close_canopy.py first)" % (group, mesh))
     ids = sorted(nodes)
     index = {i: k for k, i in enumerate(ids)}
     P = np.array([nodes[i] for i in ids])
-    tri = {group: np.array([[index[i] for i in e[3]] for e in elements if e[1] == 2 and e[2][0] == tags[group]])
-           for group in ("canopy", "vent")}
+    tri = {group: np.array([[index[i] for i in e[3]] for e in elements
+                            if e[1] == 2 and e[2] and e[2][0] == tags[group]]).reshape(-1, 3)
+           for group in groups}
     return P, tri
 
 
@@ -131,14 +141,16 @@ def read_wing(mesh):
 # OpenFOAM case
 # --------------------------------------------------------------------------------------------------
 
-def write_case(case, P, tri, aoa, speed, iterations, n_procs):
-    all_tri = np.vstack((tri["canopy"], tri["vent"]))
+def write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy=False):
+    """tri: {"canopy": ..., "vent": ...} for the closed wing, {"canopy": ...} with open_canopy (the
+    canopy is meshed as a zero-thickness baffle, fluid on both sides)."""
+    all_tri = np.vstack(list(tri.values()))
     wing = P[np.unique(all_tri)]
     wmin, wmax = wing.min(axis=0), wing.max(axis=0)
     span = wmax[1] - wmin[1]
 
     # reference values: area projected on the x-y plane (half the |z| projection of the closed
-    # surface), chord at the centre of the wing
+    # surface, or of upper + lower skin of the open canopy), chord at the centre of the wing
     a, b, c = P[all_tri[:, 0]], P[all_tri[:, 1]], P[all_tri[:, 2]]
     Aref = 0.25 * np.abs(np.cross(b - a, c - a)[:, 2]).sum()
     centre = wing[np.abs(wing[:, 1] - 0.5 * (wmin[1] + wmax[1])) < 0.02 * span]
@@ -167,7 +179,12 @@ def write_case(case, P, tri, aoa, speed, iterations, n_procs):
     omega_in = np.sqrt(k_in) / (0.09 ** 0.25 * TURBULENCE_LENGTH)
 
     write(os.path.join(case, "constant", "geometry", "wing.stl"),
-          stl_solid("canopy", P, tri["canopy"]) + stl_solid("vent", P, tri["vent"]))
+          "".join(stl_solid(group, P, t) for group, t in tri.items()))
+
+    # open canopy: zero-thickness surface, the cells on both sides are kept and the zone faces are
+    # split into two walls (wing and wing_slave); the zone faces lie between cells of the same
+    # (unnamed) cellZone, so free standing zone faces must be allowed
+    baffle = "\n            faceZone wing;\n            faceType baffle;" if open_canopy else ""
 
     write(os.path.join(case, "system", "controlDict"), foam_file("dictionary", "controlDict", """\
 application     foamRun;
@@ -195,7 +212,7 @@ functions
         libs            ("libforces.so");
         writeControl    timeStep;
         writeInterval   1;
-        patches         (wingGroup);
+        patches         ("wing.*");
         rho             rhoInf;
         rhoInf          %g;
         CofR            %s;
@@ -296,7 +313,7 @@ castellatedMeshControls
             {
                 type wall;
                 inGroups (wingGroup);
-            }
+            }%s
         }
     }
 
@@ -318,7 +335,7 @@ castellatedMeshControls
 
     insidePoint %s;
 
-    allowFreeStandingZoneFaces false;
+    allowFreeStandingZoneFaces %s;
 }
 
 snapControls
@@ -362,7 +379,8 @@ meshQualityControls
 }
 
 mergeTolerance 1e-6;""" % (vec(near_lo), vec(near_hi), vec(wake_lo), vec(wake_hi), FEATURE_LEVEL,
-                           WING_LEVEL[0], WING_LEVEL[1], WAKE_LEVEL, NEAR_LEVEL, vec(location))))
+                           WING_LEVEL[0], WING_LEVEL[1], baffle, WAKE_LEVEL, NEAR_LEVEL, vec(location),
+                           "true" if open_canopy else "false")))
 
     write(os.path.join(case, "system", "meshQualityDict"), foam_file("dictionary", "meshQualityDict", """\
 #includeEtc "caseDicts/mesh/generation/meshQualityDict"
@@ -497,7 +515,9 @@ RAS
 }"""))
 
     # initial and boundary conditions: free stream on every outer face (in- or outflow depending
-    # on the local flux, works for any angle of attack), walls on the wing
+    # on the local flux, works for any angle of attack), walls on every wing* patch (both sides of
+    # the open canopy baffle)
+    walls = '"wing.*"'
     def field(cls, name, dims, internal, patches):
         body = "dimensions      %s;\n\ninternalField   %s;\n\nboundaryField\n{\n" \
                "    #includeEtc \"caseDicts/setConstraintTypes\"\n" % (dims, internal)
@@ -508,25 +528,25 @@ RAS
     U_val = "uniform %s" % vec(U_inf)
     write(os.path.join(case, "0", "U"), field("volVectorField", "U", "[0 1 -1 0 0 0 0]", U_val, [
         ("farfield", ["type freestreamVelocity", "freestreamValue " + U_val, "value " + U_val]),
-        ("wingGroup", ["type noSlip"])]))
+        (walls, ["type noSlip"])]))
 
     write(os.path.join(case, "0", "p"), field("volScalarField", "p", "[0 2 -2 0 0 0 0]", "uniform 0", [
         ("farfield", ["type freestreamPressure", "freestreamValue uniform 0", "value uniform 0"]),
-        ("wingGroup", ["type zeroGradient"])]))
+        (walls, ["type zeroGradient"])]))
 
     k_val = "uniform %g" % k_in
     write(os.path.join(case, "0", "k"), field("volScalarField", "k", "[0 2 -2 0 0 0 0]", k_val, [
         ("farfield", ["type inletOutlet", "inletValue " + k_val, "value " + k_val]),
-        ("wingGroup", ["type kqRWallFunction", "value " + k_val])]))
+        (walls, ["type kqRWallFunction", "value " + k_val])]))
 
     w_val = "uniform %g" % omega_in
     write(os.path.join(case, "0", "omega"), field("volScalarField", "omega", "[0 0 -1 0 0 0 0]", w_val, [
         ("farfield", ["type inletOutlet", "inletValue " + w_val, "value " + w_val]),
-        ("wingGroup", ["type omegaWallFunction", "value " + w_val])]))
+        (walls, ["type omegaWallFunction", "value " + w_val])]))
 
     write(os.path.join(case, "0", "nut"), field("volScalarField", "nut", "[0 2 -1 0 0 0 0]", "uniform 0", [
         ("farfield", ["type calculated", "value uniform 0"]),
-        ("wingGroup", ["type nutkWallFunction", "value uniform 0"])]))
+        (walls, ["type nutkWallFunction", "value uniform 0"])]))
 
     # runner: sets up the blueCFD environment, then runs the given command in the case directory
     # setvars_OF12.bat puts lib\MS-MPI-10.1 on the PATH but the MPI build of libPstream is in
@@ -606,10 +626,11 @@ def print_force_coeffs(case):
 # main
 # --------------------------------------------------------------------------------------------------
 
-def run_wing(mesh, aoa, speed, case=None, iterations=ITERATIONS, n_procs=16, run=True):
-    """Write (and run unless run=False) the OpenFOAM case of the closed wing mesh; return the path
-    of its case.foam. The case directory is deleted first if it exists."""
-    if not mesh.endswith("_of.msh"):
+def run_wing(mesh, aoa, speed, case=None, iterations=ITERATIONS, n_procs=16, run=True, open_canopy=False):
+    """Write (and run unless run=False) the OpenFOAM case of the closed wing mesh, or of the open
+    canopy of the mesh (open_canopy); return the path of its case.foam. The case directory is
+    deleted first if it exists."""
+    if not open_canopy and not mesh.endswith("_of.msh"):
         print("Warning: %s does not end with _of.msh, the wing must be a closed canopy + vent surface" % mesh)
 
     name = os.path.splitext(os.path.basename(mesh))[0]
@@ -618,10 +639,15 @@ def run_wing(mesh, aoa, speed, case=None, iterations=ITERATIONS, n_procs=16, run
         shutil.rmtree(case)
 
     start = time.time()
-    print("Case %s (aoa %g deg, speed %g m/s)" % (case, aoa, speed))
-    P, tri = read_wing(mesh)
-    print("  %s: %d canopy + %d vent triangles" % (mesh, len(tri["canopy"]), len(tri["vent"])))
-    write_case(case, P, tri, aoa, speed, iterations, n_procs)
+    print("Case %s (aoa %g deg, speed %g m/s, %s)"
+          % (case, aoa, speed, "open canopy" if open_canopy else "closed wing"))
+    if open_canopy:
+        P, tri = read_wing(mesh, ("canopy",))
+        print("  %s: %d canopy triangles (open, meshed as a baffle)" % (mesh, len(tri["canopy"])))
+    else:
+        P, tri = read_wing(mesh)
+        print("  %s: %d canopy + %d vent triangles" % (mesh, len(tri["canopy"]), len(tri["vent"])))
+    write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy)
 
     foam = os.path.join(case, "case.foam")
     write(foam, "")
@@ -638,15 +664,19 @@ def run_wing(mesh, aoa, speed, case=None, iterations=ITERATIONS, n_procs=16, run
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mesh", nargs="?", default=os.path.join("msh", "demowing_of.msh"),
-                        help="closed wing mesh from close_canopy.py (default: msh/demowing_of.msh)")
+                        help="closed wing mesh from close_canopy.py (default: msh/demowing_of.msh), "
+                             "any mesh with a canopy group with --open")
     parser.add_argument("--aoa", type=float, required=True, help="angle of attack [deg]")
     parser.add_argument("--speed", type=float, required=True, help="free stream speed [m/s]")
     parser.add_argument("--iterations", type=int, default=ITERATIONS, help="SIMPLE iterations (default %d)" % ITERATIONS)
     parser.add_argument("--procs", type=int, default=16, help="MPI processes (default 16, 1 = serial)")
     parser.add_argument("--case", help="case directory (default: %s/<mesh>_aoa<aoa>_U<speed>)" % CASE_ROOT)
     parser.add_argument("--no-run", action="store_true", help="only write the case")
+    parser.add_argument("--open", action="store_true",
+                        help="open canopy: the canopy group meshed as a zero-thickness baffle, no vent")
     args = parser.parse_args()
-    run_wing(args.mesh, args.aoa, args.speed, args.case, args.iterations, args.procs, not args.no_run)
+    run_wing(args.mesh, args.aoa, args.speed, args.case, args.iterations, args.procs, not args.no_run,
+             args.open)
 
 
 if __name__ == "__main__":
