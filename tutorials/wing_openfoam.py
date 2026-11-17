@@ -14,6 +14,9 @@ wing and the air enters the wing through the intakes. Every canopy face gets a w
 side, in the patches wing and wing_slave (named after the surface). The mesh can be any gmsh
 mesh with a "canopy" group, e.g. the original <wing>.msh.
 
+Split surfaces (run_surfaces, used by wing_fsi_cfd.py for single-skin wings): every surface is its
+own <name>.stl and baffle, its two sides become the patches <name> and <name>_slave.
+
 Axes of the mesh: x chordwise (leading edge -> trailing edge), y spanwise, z up. The free stream
 is U = speed * (cos(aoa), 0, sin(aoa)): a positive angle of attack is wind from below.
 
@@ -141,9 +144,14 @@ def read_wing(mesh, groups=("canopy", "vent")):
 # OpenFOAM case
 # --------------------------------------------------------------------------------------------------
 
-def write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy=False):
+def write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy=False, split=False, Aref=None):
     """tri: {"canopy": ..., "vent": ...} for the closed wing, {"canopy": ...} with open_canopy (the
-    canopy is meshed as a zero-thickness baffle, fluid on both sides)."""
+    canopy is meshed as a zero-thickness baffle, fluid on both sides).
+
+    split: every entry of tri is its own surface <name>.stl, meshed as a zero-thickness baffle
+    (faceZone <name>), whose two sides become the patches <name> and <name>_slave; the names must
+    start with "wing" (single-skin wing: {"wing_ramair": ..., "wing_single": ...}).
+    Aref: reference area of the force coefficients (default: half the |z| projection of tri)."""
     all_tri = np.vstack(list(tri.values()))
     wing = P[np.unique(all_tri)]
     wmin, wmax = wing.min(axis=0), wing.max(axis=0)
@@ -152,7 +160,8 @@ def write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy=False)
     # reference values: area projected on the x-y plane (half the |z| projection of the closed
     # surface, or of upper + lower skin of the open canopy), chord at the centre of the wing
     a, b, c = P[all_tri[:, 0]], P[all_tri[:, 1]], P[all_tri[:, 2]]
-    Aref = 0.25 * np.abs(np.cross(b - a, c - a)[:, 2]).sum()
+    if Aref is None:
+        Aref = 0.25 * np.abs(np.cross(b - a, c - a)[:, 2]).sum()
     centre = wing[np.abs(wing[:, 1] - 0.5 * (wmin[1] + wmax[1])) < 0.02 * span]
     lRef = centre[:, 0].max() - centre[:, 0].min() if len(centre) else wmax[0] - wmin[0]
     CofR = np.array([wmin[0] + 0.25 * lRef, 0.5 * (wmin[1] + wmax[1]), wmax[2]])
@@ -178,13 +187,36 @@ def write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy=False)
     k_in = 1.5 * (speed * TURBULENCE_INTENSITY) ** 2
     omega_in = np.sqrt(k_in) / (0.09 ** 0.25 * TURBULENCE_LENGTH)
 
-    write(os.path.join(case, "constant", "geometry", "wing.stl"),
-          "".join(stl_solid(group, P, t) for group, t in tri.items()))
+    # surfaces: one wing.stl (one region per group) or, with split, one <name>.stl per group
+    if split:
+        surfaces = list(tri)
+        for name, t in tri.items():
+            write(os.path.join(case, "constant", "geometry", name + ".stl"), stl_solid(name, P, t))
+    else:
+        surfaces = ["wing"]
+        write(os.path.join(case, "constant", "geometry", "wing.stl"),
+              "".join(stl_solid(group, P, t) for group, t in tri.items()))
+    baffles = split or open_canopy
 
     # open canopy: zero-thickness surface, the cells on both sides are kept and the zone faces are
     # split into two walls (wing and wing_slave); the zone faces lie between cells of the same
     # (unnamed) cellZone, so free standing zone faces must be allowed
-    baffle = "\n            faceZone wing;\n            faceType baffle;" if open_canopy else ""
+    geometry = "".join("    %s\n    {\n        type triSurfaceMesh;\n        file \"%s.stl\";\n    }\n"
+                       % (s, s) for s in surfaces)
+    features = "\n".join("        {\n            file \"%s.eMesh\";\n            level %d;\n        }"
+                         % (s, FEATURE_LEVEL) for s in surfaces)
+    refinement = "\n".join("""\
+        %s
+        {
+            level (%d %d);
+            patchInfo
+            {
+                type wall;
+                inGroups (wingGroup);
+            }%s
+        }""" % (s, WING_LEVEL[0], WING_LEVEL[1],
+                "\n            faceZone %s;\n            faceType baffle;" % s if baffles else "")
+        for s in surfaces)
 
     write(os.path.join(case, "system", "controlDict"), foam_file("dictionary", "controlDict", """\
 application     foamRun;
@@ -252,7 +284,7 @@ boundary
          vec((hi[0], hi[1], hi[2])), vec((lo[0], hi[1], hi[2])), n[0], n[1], n[2])))
 
     write(os.path.join(case, "system", "surfaceFeaturesDict"), foam_file("dictionary", "surfaceFeaturesDict", """\
-surfaces ("wing.stl");
+surfaces (%s);
 
 includedAngle       150;
 
@@ -260,7 +292,7 @@ subsetFeatures
 {
     nonManifoldEdges    no;
     openEdges           yes;
-}"""))
+}""" % " ".join('"%s.stl"' % s for s in surfaces)))
 
     write(os.path.join(case, "system", "snappyHexMeshDict"), foam_file("dictionary", "snappyHexMeshDict", """\
 castellatedMesh true;
@@ -269,12 +301,7 @@ addLayers       false;
 
 geometry
 {
-    wing
-    {
-        type triSurfaceMesh;
-        file "wing.stl";
-    }
-    nearBox
+%s    nearBox
     {
         type searchableBox;
         min %s;
@@ -298,23 +325,12 @@ castellatedMeshControls
 
     features
     (
-        {
-            file "wing.eMesh";
-            level %d;
-        }
+%s
     );
 
     refinementSurfaces
     {
-        wing
-        {
-            level (%d %d);
-            patchInfo
-            {
-                type wall;
-                inGroups (wingGroup);
-            }%s
-        }
+%s
     }
 
     resolveFeatureAngle 30;
@@ -378,9 +394,9 @@ meshQualityControls
     #include "meshQualityDict"
 }
 
-mergeTolerance 1e-6;""" % (vec(near_lo), vec(near_hi), vec(wake_lo), vec(wake_hi), FEATURE_LEVEL,
-                           WING_LEVEL[0], WING_LEVEL[1], baffle, WAKE_LEVEL, NEAR_LEVEL, vec(location),
-                           "true" if open_canopy else "false")))
+mergeTolerance 1e-6;""" % (geometry, vec(near_lo), vec(near_hi), vec(wake_lo), vec(wake_hi), features,
+                           refinement, WAKE_LEVEL, NEAR_LEVEL, vec(location),
+                           "true" if baffles else "false")))
 
     write(os.path.join(case, "system", "meshQualityDict"), foam_file("dictionary", "meshQualityDict", """\
 #includeEtc "caseDicts/mesh/generation/meshQualityDict"
@@ -648,7 +664,24 @@ def run_wing(mesh, aoa, speed, case=None, iterations=ITERATIONS, n_procs=16, run
         P, tri = read_wing(mesh)
         print("  %s: %d canopy + %d vent triangles" % (mesh, len(tri["canopy"]), len(tri["vent"])))
     write_case(case, P, tri, aoa, speed, iterations, n_procs, open_canopy)
+    return _finish_case(case, n_procs, run, start)
 
+
+def run_surfaces(P, tri, aoa, speed, case, iterations=ITERATIONS, n_procs=16, run=True, Aref=None):
+    """Write (and run unless run=False) the OpenFOAM case of the given wing surfaces, each one a
+    zero-thickness baffle (write_case with split=True): P (n, 3) points, tri {surface name:
+    triangles (m, 3) indices into P}, names starting with "wing". Return the path of case.foam.
+    The case directory is deleted first if it exists."""
+    if os.path.isdir(case):
+        shutil.rmtree(case)
+    start = time.time()
+    print("Case %s (aoa %g deg, speed %g m/s, %s)"
+          % (case, aoa, speed, ", ".join("%s %d triangles" % (s, len(t)) for s, t in tri.items())))
+    write_case(case, P, tri, aoa, speed, iterations, n_procs, split=True, Aref=Aref)
+    return _finish_case(case, n_procs, run, start)
+
+
+def _finish_case(case, n_procs, run, start):
     foam = os.path.join(case, "case.foam")
     write(foam, "")
 

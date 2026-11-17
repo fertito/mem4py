@@ -1375,6 +1375,44 @@ cdef int readMsh(object data) except -1:
     data.M = M
 
 
+# minimum hinge spacing of a "B" set given by "EI" without "d": fraction of the median length of
+# its elements (with "d" the default spacing is the rod diameter)
+HINGE_MIN_FRACTION = 0.15
+
+
+def rodChains(adj):
+    """Split rods given as {node: {neighbour node: element}} into simple chains of nodes: open
+    chains run between nodes that are not shared by exactly two elements (free ends, branches),
+    closed chains are rings of nodes all shared by two elements. Yields (node list, closed)."""
+    done = set()                                    # walked edges (frozenset of 2 nodes)
+    for start, nb in adj.items():
+        if len(nb) == 2:
+            continue
+        for nxt in nb:
+            if frozenset((start, nxt)) in done:
+                continue
+            chain = [start, nxt]
+            done.add(frozenset((start, nxt)))
+            while len(adj[chain[-1]]) == 2:
+                a, b = adj[chain[-1]]
+                step = b if a == chain[-2] else a
+                done.add(frozenset((chain[-1], step)))
+                chain.append(step)
+            yield chain, False
+    for start, nb in adj.items():                   # rings: every node of degree 2, none walked yet
+        n0 = next(iter(nb))
+        if frozenset((start, n0)) in done:
+            continue
+        chain = [start, n0]
+        done.add(frozenset((start, n0)))
+        while chain[-1] != start:
+            a, b = adj[chain[-1]]
+            step = b if a == chain[-2] else a
+            done.add(frozenset((chain[-1], step)))
+            chain.append(step)
+        yield chain[:-1], True
+
+
 def buildRodHinges(data, int [:, ::1] Nc, unsigned int nelemsCable, double [:] LCable, double [:] E2, bnames):
     """
     Build the bending hinges of rods made of "B" elements.
@@ -1385,6 +1423,15 @@ def buildRodHinges(data, int [:, ::1] Nc, unsigned int nelemsCable, double [:] L
     elements of the same set). Free rod ends get no hinge, and different sets never share a
     hinge. A node shared by more than two elements of the set is a branch: no hinge is placed
     there and a warning is printed.
+
+    Hinges are at least "hinge_min_length" apart along the rod (set property, default the rod
+    diameter "d": bending on a shorter length is not beam bending; without "d",
+    HINGE_MIN_FRACTION times the median element length of the set; 0 = a hinge at every interior
+    node, the behaviour before this option): an interior node closer than
+    that to the previous hinge gets no hinge, the hinges on both sides of it then span several
+    elements (n0 and n2 are the neighbouring hinge nodes, l0 the mean of the two rod lengths in
+    between). Without this, nearly coincident nodes of a mesh give hinges of stiffness EI / l0 with
+    l0 -> 0 and a kink there gives a huge initial moment, which makes the solver diverge.
 
     sets data.Nb [nBend, 3] (node 0, middle node, node 2), data.nBend, data.kBend (EI / l0),
     data.EIBend, data.l0Bend, data.rBend (outer radius d / 2), data.rodOfHinge and
@@ -1443,41 +1490,81 @@ def buildRodHinges(data, int [:, ::1] Nc, unsigned int nelemsCable, double [:] L
                 stack.extend(m for m in adj[n] if m not in comp)
             nRodsSet += 1
 
-        nBranch = 0
+        # minimum hinge spacing along the rod: shorter segments (e.g. nearly coincident nodes of
+        # the export) are not given a hinge of their own, their bending goes to the neighbouring
+        # hinges (a hinge on a segment of length l has the stiffness EI / l, which is unbounded)
+        if "hinge_min_length" in props:
+            lMin = float(props["hinge_min_length"])
+        elif "d" in props:
+            lMin = float(props["d"])
+        else:
+            lMin = HINGE_MIN_FRACTION * float(np.median(L0Arr[els]))
+
+        nBranch = sum(1 for nb in adj.values() if len(nb) > 2)
         nHingeSet = 0
+        nMerged = 0
         phiMax = 0.
         kappaMax = 0.
-        for n, nb in adj.items():
-            if len(nb) > 2:
-                nBranch += 1
-                continue
-            if len(nb) != 2:
-                continue
-            (n0, e0), (n2, e1) = nb.items()
-            l0 = 0.5 * (L0Arr[e0] + L0Arr[e1])
-            hinges.append([n0, n, n2])
-            kB.append(EI / l0)
-            EIList.append(EI)
-            l0List.append(l0)
-            rList.append(props["d"] / 2 if "d" in props else 0.)
-            rodID.append(comp[n])
-            elOfHinge.append([e0, e1])
-            nHingeSet += 1
+        for chain, closed in rodChains(adj):
+            # chain: node sequence (closed: the first node is not repeated), arc[k] = rest length
+            # from chain[0] to chain[k] along the rod
+            nodesC = list(chain) + ([chain[0]] if closed else [])
+            elsC = [adj[nodesC[k]][nodesC[k + 1]] for k in range(len(nodesC) - 1)]
+            arc = np.concatenate(([0.], np.cumsum([L0Arr[e] for e in elsC])))
 
-            # initial turning angle (rest state is straight)
-            p0 = np.array([data.X0[n0], data.Y0[n0], data.Z0[n0]])
-            p1 = np.array([data.X0[n], data.Y0[n], data.Z0[n]])
-            p2 = np.array([data.X0[n2], data.Y0[n2], data.Z0[n2]])
-            ea = p1 - p0
-            eb = p2 - p1
-            c = np.dot(ea, eb) / (np.linalg.norm(ea) * np.linalg.norm(eb))
-            phi = np.arccos(np.clip(c, -1., 1.))
-            phiMax = max(phiMax, phi)
-            kappaMax = max(kappaMax, 2 * np.tan(phi / 2) / l0)
+            # hinge nodes: interior nodes at least lMin apart along the rod (the chain ends are
+            # free ends or branch nodes and get no hinge, as before)
+            keep = [0]
+            for k in range(1, len(nodesC) - 1):
+                if arc[k] - arc[keep[-1]] >= lMin:
+                    keep.append(k)
+            last = len(nodesC) - 1
+            if len(keep) > 1 and arc[last] - arc[keep[-1]] < lMin:
+                keep.pop()
+            keep.append(last)
+            nMerged += (len(nodesC) - 2) - (len(keep) - 2)
+
+            # closed rod: the start node is a hinge too, between the last and the first kept node
+            ring = keep[:-1] if closed else None
+            if closed and len(ring) >= 3:
+                triples = [(ring[i - 1], ring[i], ring[(i + 1) % len(ring)]) for i in range(len(ring))]
+            else:
+                triples = [(keep[i - 1], keep[i], keep[i + 1]) for i in range(1, len(keep) - 1)]
+
+            for k0, k1, k2 in triples:
+                n0, n, n2 = nodesC[k0], nodesC[k1], nodesC[k2]
+                if n0 == n2:
+                    continue
+                la = (arc[k1] - arc[k0]) % arc[last] if closed else arc[k1] - arc[k0]
+                lb = (arc[k2] - arc[k1]) % arc[last] if closed else arc[k2] - arc[k1]
+                l0 = 0.5 * (la + lb)
+                hinges.append([n0, n, n2])
+                kB.append(EI / l0)
+                EIList.append(EI)
+                l0List.append(l0)
+                rList.append(props["d"] / 2 if "d" in props else 0.)
+                rodID.append(comp[n])
+                # the two bar elements meeting at the middle node (output of the moment)
+                elOfHinge.append([elsC[k1 - 1] if k1 > 0 else elsC[-1], elsC[k1 % len(elsC)]])
+                nHingeSet += 1
+
+                # initial turning angle (rest state is straight)
+                p0 = np.array([data.X0[n0], data.Y0[n0], data.Z0[n0]])
+                p1 = np.array([data.X0[n], data.Y0[n], data.Z0[n]])
+                p2 = np.array([data.X0[n2], data.Y0[n2], data.Z0[n2]])
+                ea = p1 - p0
+                eb = p2 - p1
+                c = np.dot(ea, eb) / (np.linalg.norm(ea) * np.linalg.norm(eb))
+                phi = np.arccos(np.clip(c, -1., 1.))
+                phiMax = max(phiMax, phi)
+                kappaMax = max(kappaMax, 2 * np.tan(phi / 2) / l0)
 
         if nBranch > 0:
             print("WARNING: set {}: {} node(s) shared by more than two elements, "
                   "no bending hinge placed there".format(name, nBranch))
+        if nMerged > 0 and data.silent is False:
+            print("Rod bending in set {}: {} interior node(s) closer than {:.4g} m (along the rod) to "
+                  "the previous hinge get no hinge of their own".format(name, nMerged, lMin))
 
         summary.append((name, nRodsSet, nHingeSet, EI, phiMax, kappaMax,
                         props.get("d", 0.) / 2 * float(E2Arr[els[0]]) * kappaMax))

@@ -8,6 +8,9 @@ Every wing lives in its own directory <wing>/ (default demowing/) containing
     <wing>.json             run parameters, "iterations"[0] gives
                                 P_ratio  multiplier applied to the CSV pressure
                                 P_vent   internal pressure [Pa] added to every canopy triangle
+                                         (single-skin wing, wing_type single_skin in
+                                         <wing>_data.csv: to the ram air triangles only, see
+                                         single_skin.py)
     <wing>_canopy.csv       triangles (header "triangle,piece") or lines (header "line,piece")
     <wing>_diagonals.csv    of each part of the wing, as gmsh element numbers, used to split the
     <wing>_ribs.csv         vtk result per part (optional)
@@ -113,6 +116,8 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 
 import mem4py as m4p
 
+from single_skin import canopy_zones, is_single_skin, RAMAIR
+
 
 WING_DIR = "demowing"            # default wing directory, see --wing
 JSON_ITERATION = 0               # default json iteration for P_ratio, P_vent and the output directory, see --iteration
@@ -139,6 +144,16 @@ class Wing:
         for path in (self.msh, self.pressure_csv, self.json):
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
+        self.single_skin = is_single_skin(self.dir, self.name)
+        self._vent_triangles = None
+
+    def vent_triangles(self):
+        """gmsh numbers of the canopy triangles loaded by P_vent: None (every canopy triangle) for a
+        ram-air wing, the ram air triangles of single_skin.canopy_zones for a single-skin wing."""
+        if self.single_skin and self._vent_triangles is None:
+            zones, _ = canopy_zones(self.dir, self.name, verbose=False)
+            self._vent_triangles = {i for i, z in zones.items() if z == RAMAIR}
+        return self._vent_triangles
 
     def iteration(self, iteration=JSON_ITERATION):
         """The json entry of the given iteration (dict)."""
@@ -276,7 +291,9 @@ def load_fsi_pressure(csm, wing, internal_pressure=0.0, ratio=1.0):
     """Read the pressure CSV of the wing (triangle = gmsh element number, pressure [Pa]) and return
     the pressure of each FSI triangle of mem4py, in csm.elFSI order:
         p = -ratio * p_csv + internal_pressure
-    (the CSV sign is inverted). Triangles are matched by their sorted node triple."""
+    (the CSV sign is inverted). Triangles are matched by their sorted node triple.
+    Single-skin wing: internal_pressure only on the ram air triangles (wing.vent_triangles()), the
+    single skin triangles get p = -ratio * p_csv (p_csv = p_outer - p_inner of wing_fsi_cfd.py)."""
     csv_path = wing.pressure_csv
     msh_tri = msh_triangles(wing.msh)
     nodes_to_p = {}
@@ -286,10 +303,13 @@ def load_fsi_pressure(csm, wing, internal_pressure=0.0, ratio=1.0):
             if i not in msh_tri:
                 raise ValueError("triangle %d of %s is not a triangle in %s" % (i, csv_path, wing.msh))
             nodes_to_p[msh_tri[i]] = float(r["pressure"])
+    vent = wing.vent_triangles()
+    vent_keys = None if vent is None else {msh_tri[i] for i in vent if i in msh_tri}
 
     Nm = np.asarray(csm.Nm)[:csm.nelemsMem]
     elFSI = np.asarray(csm.elFSI)[:csm.nFSI]
     p = np.empty(csm.nFSI)
+    vented = np.ones(csm.nFSI, dtype=bool)      # triangles loaded by P_vent
     missing = 0
     for k, el in enumerate(elFSI):
         key = tuple(sorted(int(n) for n in Nm[el, 1:4]))
@@ -298,11 +318,17 @@ def load_fsi_pressure(csm, wing, internal_pressure=0.0, ratio=1.0):
         else:
             p[k] = 0.0
             missing += 1
+        if vent_keys is not None and key not in vent_keys:
+            vented[k] = False
     if missing:
         print("  Warning: %d FSI triangles have no pressure in %s, set to 0 (before P_vent)"
               % (missing, csv_path))
     print("Pressure read from %s: %d triangles" % (csv_path, len(nodes_to_p)))
-    return -ratio * p + internal_pressure
+    if vent_keys is not None:
+        n_vent = int(vented.sum())
+        print("Single-skin wing: P_vent applied to %d ram air FSI triangles, not to the %d single skin ones"
+              % (n_vent, csm.nFSI - n_vent))
+    return -ratio * p + np.where(vented, internal_pressure, 0.0)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -788,7 +814,9 @@ def write_force_vtk(wing, vtk_path, out_dir, ratio, internal_pressure):
     if missing:
         print("  Warning: %d canopy triangles have no pressure in %s, only P_vent applied"
               % (missing, wing.pressure_csv))
-    p = np.array([-ratio * p_csv.get(i, 0.0) + internal_pressure for i in tri_id])
+    vent = wing.vent_triangles()             # single-skin wing: P_vent on the ram air triangles only
+    p = np.array([-ratio * p_csv.get(i, 0.0) + (internal_pressure if vent is None or i in vent else 0.0)
+                  for i in tri_id])
 
     vtk = read_mem4py_vtk(vtk_path)                     # point index = msh node - 1
     X = vtk["points"] + vtk["point_data"]["u"][2]       # deformed
@@ -1090,7 +1118,8 @@ def main():
 
     pFSI = load_fsi_pressure(csm, wing, internal_pressure, ratio)
     print("CSV pressure multiplied by %g" % ratio)
-    print("Internal pressure %g Pa added to every canopy triangle" % internal_pressure)
+    print("Internal pressure %g Pa added to %s" % (
+        internal_pressure, "the ram air triangles" if wing.single_skin else "every canopy triangle"))
     np.asarray(csm.pFSI)[:csm.nFSI] = pFSI       # write into mem4py's own pressure buffer
     print("FSI pressure: min %.4g, mean %.4g, max %.4g Pa" % (pFSI.min(), pFSI.mean(), pFSI.max()))
 

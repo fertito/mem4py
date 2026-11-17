@@ -1048,8 +1048,10 @@ cdef int membraneWrinklingJarasjarungkiat(double [:] ELocal,
         # if wrinkling model counter for current element is below iteration goal
         if wrinkling_iter < iter_goal:
 
-            # penalty factor
-            if sigma_max <= S2:
+            # penalty factor. S2 == 0: element not strained yet (e.g. far from the load in the
+            # first time steps), nothing to penalise; sigma_max / S2 would be inf and the
+            # stiffness, mass and stress inf * 0 = NaN
+            if sigma_max <= S2 or S2 == 0:
 
                 P[el] = 1
 

@@ -54,6 +54,21 @@ wing through the intakes. Only the faces on the outer side of the canopy are map
 inner side pressure is printed for information), and P_vent of the json is left as it is. With
 --pressure-only the open / closed case is recognised from its patches (no wing_vent = open).
 
+Single-skin wing (wing_type single_skin in <wing>_data.csv): the canopy triangles are split by
+single_skin.py into ram air cells (closed cells, lower skin over the whole chord, e.g. the tip
+cells) and single skin (every other cell, leading edge included), written to
+<wing>/iter_NN/<wing>_zones.csv (triangle,zone). Both parts are zero-thickness baffles (--open is
+implied), wing_openfoam.py run_surfaces:
+    wing_ramair.stl -> patches wing_ramair, wing_ramair_slave
+    wing_single.stl -> patches wing_single, wing_single_slave
+Every wall face is put on the outer or the inner side of the canopy by comparing its normal with the
+outward normal of the nearest canopy triangle (whole patch when 90 % of its faces agree). The
+pressure CSV then holds
+    ram air triangles      p_outer               (paraglider_fsi.py: P_vent - p_outer)
+    single skin triangles  p_outer - p_inner     (paraglider_fsi.py: p_inner - p_outer, no P_vent)
+along the outward normal (msh node order of the canopy triangles). P_vent of the json is not
+changed. The reference area of the force coefficients is the z projection of the upper skin.
+
 The previous <wing>_pressure.csv is kept as <wing>/iter_NN/<wing>_pressure_previous.csv and a copy
 of the new one is written to <wing>/iter_NN/<wing>_pressure.csv.
 
@@ -79,7 +94,8 @@ from scipy.spatial import cKDTree
 
 from close_canopy import read_msh, write_msh, close_canopy
 from paraglider_fsi import read_mem4py_vtk
-from wing_openfoam import run_wing, ITERATIONS, RHO_AIR
+from single_skin import canopy_zones, is_single_skin, write_zones_csv, RAMAIR, SINGLE
+from wing_openfoam import run_wing, run_surfaces, ITERATIONS, RHO_AIR
 
 
 WING_DIR = "demowing"
@@ -235,6 +251,12 @@ def is_open_case(case):
     return "wing_vent" not in read_boundary(os.path.join(case, "constant", "polyMesh", "boundary"))
 
 
+def is_single_skin_case(case):
+    """True if the case was meshed as a single-skin wing (wing_single / wing_ramair baffles)."""
+    patches = read_boundary(os.path.join(case, "constant", "polyMesh", "boundary"))
+    return any(p.startswith(("wing_single", "wing_ramair")) for p in patches)
+
+
 def latest_time(case):
     times = [d for d in os.listdir(case) if os.path.isdir(os.path.join(case, d))
              and d.replace(".", "", 1).isdigit() and float(d) > 0]
@@ -317,6 +339,100 @@ def outer_canopy_faces(case, time, tri_c, tri_a):
 # pressure mapping
 # --------------------------------------------------------------------------------------------------
 
+MIN_PATCH_SIDE = 0.9    # single skin: a patch is on one side when this fraction of its faces is
+
+
+def sided_faces(case, time, patches, tri_c, n_out):
+    """Faces of the given baffle patches split into the outer and the inner side of the canopy.
+
+    A face is on the outer side when its area vector (out of its fluid cell, into the fabric) is
+    opposite to the outward normal n_out of the nearest canopy triangle (tri_c, n_out: triangles of
+    the surface the patches come from). snappyHexMesh normally puts one side of a baffle in each
+    patch: when at least MIN_PATCH_SIDE of the faces of a patch agree, the whole patch goes to that
+    side (the face by face test can pick a triangle of the opposite skin at a sharp trailing edge),
+    otherwise every face goes to its own side.
+
+    Returns ((centres, area vectors, kinematic p) of the outer faces, same for the inner faces)."""
+    tree = cKDTree(tri_c)
+    sides = {True: [], False: []}
+    for patch in patches:
+        c, a, p = wall_faces(case, time, patch)
+        _, k = tree.query(c)
+        outer = np.einsum("ij,ij->i", a, n_out[k]) < 0
+        frac = outer.mean() if len(p) else 0.5
+        if max(frac, 1 - frac) >= MIN_PATCH_SIDE:
+            outer[:] = frac > 0.5
+            how = "%s side (%.1f%% of the faces)" % ("outer" if frac > 0.5 else "inner", 100 * max(frac, 1 - frac))
+        else:
+            how = "mixed sides (%.1f%% outer), side chosen face by face" % (100 * frac)
+        print("  %s: %d faces, %s" % (patch, len(p), how))
+        for side in (True, False):
+            sides[side].append((c[outer == side], a[outer == side], p[outer == side]))
+    return [tuple(np.concatenate(x) for x in zip(*sides[side])) for side in (True, False)]
+
+
+def single_skin_pressure(case, time, msh, zones):
+    """Pressure of every canopy triangle of a single-skin wing case (wing_ramair / wing_single
+    baffles), as written to <wing>_pressure.csv:
+        ram air triangles      p_outer
+        single skin triangles  p_outer - p_inner
+    so that paraglider_fsi.py applies -p_csv (+ P_vent on the ram air triangles only), i.e.
+    p_inner - p_outer along the outward normal on the single skin. p = RHO_AIR * p_kinematic.
+
+    The outward normal of a triangle is its msh node order normal ((x2 - x1) x (x3 - x1)), checked
+    to point up on average (the canopy is oriented outward by the wing export).
+    Returns ids, tri_c, tri_a, the outward unit normals, the zone of every triangle, p and the
+    pressure force on the CFD faces used [N] (to check the mapping)."""
+    ids, tri_c, tri_a = canopy_triangles(msh)
+    unknown = [i for i in ids if i not in zones]
+    if unknown:
+        raise ValueError("%d canopy triangles of %s have no zone (first: %d)" % (len(unknown), msh, unknown[0]))
+    n_out = tri_a / np.linalg.norm(tri_a, axis=1)[:, None]
+    if tri_a[:, 2].sum() < 0:
+        print("  Warning: the canopy normals point down on average, flipped to get the outward normal")
+        n_out = -n_out
+    zone = np.array([zones[i] for i in ids])
+
+    patches = read_boundary(os.path.join(case, "constant", "polyMesh", "boundary"))
+    p = np.full(len(ids), np.nan)
+    F_faces = np.zeros(3)
+    for z, surface in ((RAMAIR, "wing_ramair"), (SINGLE, "wing_single")):
+        sel = np.flatnonzero(zone == z)
+        names = sorted(q for q in patches if q in (surface, surface + "_slave"))
+        if len(sel) == 0:
+            continue
+        if len(names) != 2:
+            raise ValueError("%d %s triangles but patches %s in %s" % (len(sel), z, names, case))
+        (oc, oa, op), (ic, ia, ip) = sided_faces(case, time, names, tri_c[sel], n_out[sel])
+        op, ip = RHO_AIR * op, RHO_AIR * ip
+        p_out = map_side(tri_c[sel], tri_a[sel], oc, oa, op, ids[sel], z + " outer")
+        if z == RAMAIR:
+            p[sel] = p_out
+            F_faces += (op[:, None] * oa).sum(axis=0)
+            area = np.linalg.norm(ia, axis=1)
+            print("  %s inner side: p from %.1f to %.1f Pa, area weighted mean %.2f Pa (information only, "
+                  "P_vent of the json is used)" % (z, ip.min(), ip.max(), (ip * area).sum() / area.sum()))
+        else:
+            p_in = map_side(tri_c[sel], tri_a[sel], ic, ia, ip, ids[sel], z + " inner")
+            p[sel] = p_out - p_in
+            F_faces += (op[:, None] * oa).sum(axis=0) + (ip[:, None] * ia).sum(axis=0)
+            print("  %s: p_outer - p_inner from %.1f to %.1f Pa" % (z, p[sel].min(), p[sel].max()))
+    return ids, tri_c, tri_a, n_out, zone, p, F_faces
+
+
+def map_side(tri_c, tri_a, face_c, face_a, face_p, ids, label):
+    """map_pressure of one side of the canopy, with its printout."""
+    if len(face_p) == 0:
+        raise ValueError("no CFD face on the %s side" % label)
+    p, sign, widened, nearest_only = map_pressure(tri_c, tri_a, face_c, face_a, face_p)
+    print("  %s: %d faces, p from %.1f to %.1f Pa -> %d triangles (%d by widened search)"
+          % (label, len(face_p), face_p.min(), face_p.max(), len(p), widened))
+    if len(nearest_only):
+        print("  Warning: %d %s triangles without a CFD face of compatible normal nearby (first: %d at %s), "
+              "nearest face used" % (len(nearest_only), label, ids[nearest_only[0]], np.round(tri_c[nearest_only[0]], 3)))
+    return p
+
+
 def canopy_triangles(msh):
     """gmsh element numbers, centroids and area vectors of the canopy triangles of msh."""
     names, nodes, elements = read_msh(msh)
@@ -364,6 +480,19 @@ def write_pressure_csv(wing_dir, name, out_dir):
     time = latest_time(case)
     print("canopy pressure: OpenFOAM result %s, time %s" % (case, time))
 
+    if is_single_skin_case(case):
+        zones, _ = canopy_zones(wing_dir, name, verbose=False)
+        ids, tri_c, tri_a, n_out, zone, p, F_faces = single_skin_pressure(
+            case, time, os.path.join(out_dir, name + "_cfd.msh"), zones)
+        # check: force on the CFD faces used and on the triangles, -p_csv * A * n_out
+        A = np.linalg.norm(tri_a, axis=1)
+        F_tri = -(p[:, None] * A[:, None] * n_out).sum(axis=0)
+        print("  pressure force on the canopy [N]: CFD faces (%.1f, %.1f, %.1f), triangles (%.1f, %.1f, %.1f)"
+              % (tuple(F_faces) + tuple(F_tri)))
+        print("  %d ram air triangles (p_outer), %d single skin triangles (p_outer - p_inner)"
+              % ((zone == RAMAIR).sum(), (zone == SINGLE).sum()))
+        return save_pressure_csv(wing_dir, name, out_dir, ids, p)
+
     ids, tri_c, tri_a = canopy_triangles(os.path.join(out_dir, name + "_cfd.msh"))
     if is_open_case(case):
         face_c, face_a, face_p = outer_canopy_faces(case, time, tri_c, tri_a)
@@ -384,7 +513,11 @@ def write_pressure_csv(wing_dir, name, out_dir):
     F_tri = (p[:, None] * sign * tri_a).sum(axis=0)
     print("  pressure force on the canopy [N]: CFD faces (%.1f, %.1f, %.1f), triangles (%.1f, %.1f, %.1f)"
           % (tuple(F_faces) + tuple(F_tri)))
+    return save_pressure_csv(wing_dir, name, out_dir, ids, p)
 
+
+def save_pressure_csv(wing_dir, name, out_dir, ids, p):
+    """<wing>/<wing>_pressure.csv (previous one kept in out_dir) and its copy in out_dir."""
     csv = os.path.join(wing_dir, name + "_pressure.csv")
     if os.path.isfile(csv):
         shutil.copyfile(csv, os.path.join(out_dir, name + "_pressure_previous.csv"))
@@ -426,6 +559,26 @@ def update_vent_pressure(wing_dir, name, out_dir, iteration):
     return p_vent
 
 
+def single_skin_surfaces(nodes, elements, zones, skin):
+    """Points and {"wing_ramair": triangles, "wing_single": triangles} of the canopy (msh nodes
+    {id: xyz} of the CFD wing shape, zones / skin of single_skin.canopy_zones), empty surfaces left
+    out, and the reference area: z projection of the upper skin."""
+    canopy = [e for e in elements if e[1] == 2 and e[0] in zones]
+    ids = sorted({i for e in canopy for i in e[3]})
+    index = {i: k for k, i in enumerate(ids)}
+    P = np.array([nodes[i] for i in ids])
+    tri = {"wing_ramair": [], "wing_single": []}
+    upper = []
+    for e in canopy:
+        t = [index[i] for i in e[3]]
+        tri["wing_ramair" if zones[e[0]] == RAMAIR else "wing_single"].append(t)
+        if skin[e[0]] == "T":
+            upper.append(t)
+    upper = np.array(upper, dtype=int).reshape(-1, 3)
+    Aref = 0.5 * np.abs(np.cross(P[upper[:, 1]] - P[upper[:, 0]], P[upper[:, 2]] - P[upper[:, 0]])[:, 2]).sum()
+    return P, {s: np.array(t, dtype=int) for s, t in tri.items() if t}, Aref
+
+
 # --------------------------------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------------------------------
@@ -455,8 +608,11 @@ def main():
     roll, pitch, yaw = (float(it.get(k, 0.0)) for k in ("Wing_Roll", "Wing_Pitch", "Wing_Yaw"))
     out_dir = os.path.join(wing_dir, "iter_%02d" % n)
     os.makedirs(out_dir, exist_ok=True)
-    print("%s iteration %d: speed %g m/s, Glide_angle %g deg, wing roll %g, pitch %g, yaw %g deg"
-          % (name, n, speed, glide, roll, pitch, yaw))
+    single_skin = is_single_skin(wing_dir, name)
+    print("%s iteration %d: speed %g m/s, Glide_angle %g deg, wing roll %g, pitch %g, yaw %g deg%s"
+          % (name, n, speed, glide, roll, pitch, yaw, ", single-skin wing" if single_skin else ""))
+    if single_skin and args.open:
+        print("  single-skin wing: --open ignored (the canopy is always meshed as baffles)")
 
     if not args.pressure_only:
         # wing shape
@@ -474,7 +630,13 @@ def main():
 
         cfd_msh = os.path.join(out_dir, name + "_cfd.msh")
         write_msh(cfd_msh, names, sorted(nodes.items()), elements)
-        if args.open:
+        if single_skin:
+            zones, skin = canopy_zones(wing_dir, name)
+            write_zones_csv(os.path.join(out_dir, name + "_zones.csv"), zones)
+            P, tri, Aref = single_skin_surfaces(nodes, elements, zones, skin)
+            run_surfaces(P, tri, glide, speed, os.path.join(out_dir, "openfoam"), args.iterations, args.procs,
+                         run=not args.no_run, Aref=Aref)
+        elif args.open:
             run_wing(cfd_msh, glide, speed, os.path.join(out_dir, "openfoam"), args.iterations, args.procs,
                      run=not args.no_run, open_canopy=True)
         else:
@@ -484,7 +646,10 @@ def main():
 
     if not args.no_run:
         write_pressure_csv(wing_dir, name, out_dir)
-        if is_open_case(os.path.join(out_dir, "openfoam")):
+        if is_single_skin_case(os.path.join(out_dir, "openfoam")):
+            print("single-skin wing: P_vent of %s iteration %d not changed (applied to the ram air cells only)"
+                  % (name + ".json", n))
+        elif is_open_case(os.path.join(out_dir, "openfoam")):
             print("open canopy: P_vent of %s iteration %d not changed" % (name + ".json", n))
         else:
             update_vent_pressure(wing_dir, name, out_dir, n)
